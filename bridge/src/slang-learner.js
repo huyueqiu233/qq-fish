@@ -77,6 +77,9 @@ export function normalizeSlangEntry(raw) {
         : ev))
       : [],
     lastInferenceCount: Math.max(0, Number(entry.lastInferenceCount) || 0),
+    // 补课研究的重试控制：没确认的词不能每轮都重新研究（2026-11-09）
+    researchAttempts: Math.max(0, Number(entry.researchAttempts) || 0),
+    lastResearchAt: String(entry.lastResearchAt || ''),
     createdAt: String(entry.createdAt || nowIso()),
     updatedAt: String(entry.updatedAt || nowIso()),
   };
@@ -212,20 +215,53 @@ export function mergeEvidence(current, incoming) {
   return merged.slice(-20);
 }
 
-export function buildSlangContext(entries, max = 8) {
-  const confirmed = (entries || [])
-    .filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning)
+/**
+ * 按语料挑出要注入的词条（不拼文本）。
+ *
+ * 传了 corpus 就**只挑真的出现在这段对话里的词条**，一个都没命中就返回空数组；
+ * 不传 corpus 保留旧行为（按出现次数）。
+ */
+export function matchSlangEntries(entries, max = 8, corpus = '') {
+  const limit = Math.max(1, Math.min(30, Number(max) || 8));
+  const confirmedPool = (entries || [])
+    .filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning);
+  let picked = confirmedPool;
+  if (corpus) {
+    const hay = String(corpus).toLowerCase();
+    picked = confirmedPool.filter((e) => {
+      const word = String(e.content).toLowerCase().trim();
+      // 单字（比如「6」）几乎什么都能命中，不参与匹配
+      return word.length >= 2 && hay.includes(word);
+    });
+  }
+  return picked
     .sort((a, b) => (b.count || 0) - (a.count || 0))
-    .slice(0, Math.max(1, Math.min(30, Number(max) || 8)));
-  if (!confirmed.length) return '';
-  const lines = confirmed.map((e) => {
-    const clean = (s) => escapeLearnerText(String(s ?? '').replace(/\[CQ:/gi, '[CQ：'));
+    .slice(0, limit);
+}
+
+/** 把挑好的词条拼成注入块。 */
+export function formatSlangBlock(list, corpus = '') {
+  if (!Array.isArray(list) || !list.length) return '';
+  const clean = (s) => escapeLearnerText(String(s ?? '').replace(/\[CQ:/gi, '[CQ：'));
+  const lines = list.map((e) => {
     let line = `- ${clean(e.content)}：${clean(e.meaning)}`;
     if (e.usage) line += `（用法：${clean(e.usage)}）`;
     if (e.example) line += `（例：${clean(e.example)}）`;
     return line;
   });
-  return `【群聊黑话表】群里已确认/常用的网络用语和梗（按出现次数排序，知道即可，不要刻意堆砌）：\n${lines.join('\n')}`;
+  const heading = corpus
+    ? '【群聊黑话表】下面这些词出现在当前对话里，知道就用、别硬塞（不确定就自然问一句）'
+    : '【群聊黑话表】群里已确认/常用的网络用语和梗（按出现次数排序，知道即可，不要刻意堆砌）';
+  return `${heading}：\n${lines.join('\n')}`;
+}
+
+/**
+ * 生成注入用的黑话表（兼容旧调用）。
+ *
+ * 传了 corpus 就只注入命中的词条，没命中返回空串；不传 corpus 保留旧行为。
+ */
+export function buildSlangContext(entries, max = 8, corpus = '') {
+  return formatSlangBlock(matchSlangEntries(entries, max, corpus), corpus);
 }
 
 export function buildExtractionPrompt(messages) {

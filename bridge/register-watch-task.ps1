@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$here = $PSScriptRoot
+$here = 'C:\Users\Lenovo\Documents\deepseek-harness\tools\qq-bridge\qq-bridge-main'
 $ps1 = Join-Path $here 'watch-dsh-port.ps1'
 $vbs = Join-Path $here 'run-watch-hidden.vbs'
 $taskName = 'DshQqBridgeWatch'

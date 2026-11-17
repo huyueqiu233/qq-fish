@@ -34,6 +34,37 @@ export function extractForwardIds(segments) {
   return out;
 }
 
+function decodeXmlEntities(s) {
+  return String(s ?? '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * QQ 的"聊天记录套聊天记录"在合并转发里是一张 XML 卡片（serviceID=35, action=viewMultiMsg），
+ * 里面没有 OneBot 能取到的转发 id，只有几行 <title> 预览和总条数。
+ * 解析这几行预览，比给模型一个 [卡片消息] 有用得多。
+ */
+function xmlCardText(d) {
+  const raw = decodeXmlEntities(String(d?.data ?? d?.xml ?? ''));
+  if (!raw) return '[卡片消息]';
+  const brief = (raw.match(/brief="([^"]*)"/) || [])[1] || '[聊天记录]';
+  const total = (raw.match(/tSum="(\d+)"/) || [])[1] || '';
+  const titles = [];
+  const re = /<title[^>]*>([\s\S]*?)<\/title>/g;
+  let m;
+  while ((m = re.exec(raw))) {
+    const t = decodeXmlEntities(m[1]).replace(/\s+/g, ' ').trim();
+    if (!t) continue;
+    if (/^(群聊的聊天记录|聊天记录|查看\d*条?转发消息|查看聊天记录)$/.test(t)) continue;
+    if (!titles.includes(t)) titles.push(t);
+  }
+  const count = total ? '（共 ' + total + ' 条）' : '';
+  if (!titles.length) return brief + count;
+  return brief + count + '：' + titles.slice(0, 8).join(' / ').slice(0, 400);
+}
+
 function segmentText(seg) {
   if (typeof seg === 'string') return seg;
   if (!seg || typeof seg !== 'object') return '';
@@ -49,6 +80,7 @@ function segmentText(seg) {
     case 'reply': return '[引用]';
     case 'forward': return '[转发]';
     case 'json': return '[卡片消息]';
+    case 'xml': return xmlCardText(d);
     default: return `[${seg.type ?? '未知'}]`;
   }
 }
@@ -176,13 +208,14 @@ function collectSegmentMeta(content) {
 }
 
 export function formatForwardResponse(data, options = {}) {
-  const maxMessages = Math.max(1, Math.min(100, Number(options.maxMessages) || 50));
+  const maxMessages = Math.max(1, Math.min(300, Number(options.maxMessages) || 100));
   const maxCharsPerMessage = Math.max(1, Math.min(2000, Number(options.maxCharsPerMessage) || 500));
+  const offset = Math.max(0, Math.floor(Number(options.offset) || 0));
   const raw = Array.isArray(data) ? data : (Array.isArray(data?.messages) ? data.messages : []);
   const total = raw.length;
-  const truncatedByCount = total > maxMessages;
+  const truncatedByCount = total > offset + maxMessages;
   let textTruncated = false;
-  const messages = raw.slice(0, maxMessages).map((node, index) => {
+  const messages = raw.slice(offset, offset + maxMessages).map((node, index) => {
     const fullText = nodeText(node);
     // 切点落在代理对中间时必须前移一个码元（判据与 md-to-plain.js 的 splitForQQ 一致）：
     // `slice(0, max)` 是按 UTF-16 码元切的，emoji/生僻字会被切成孤立高代理，
@@ -202,7 +235,7 @@ export function formatForwardResponse(data, options = {}) {
     const content = nodeContent(node);
     const meta = collectSegmentMeta(content);
     return {
-      index: index + 1,
+      index: offset + index + 1,
       sender: senderName(node),
       userId: senderUserId(node),
       time: nodeTime(node),
@@ -213,8 +246,13 @@ export function formatForwardResponse(data, options = {}) {
       nestedForwardIds: meta.nestedForwardIds
     };
   });
+  const nextOffset = offset + messages.length;
+  const hasMore = nextOffset < total;
   return {
     total,
+    offset,
+    hasMore,
+    nextOffset: hasMore ? nextOffset : null,
     truncated: truncatedByCount || textTruncated,
     textTruncated,
     messages

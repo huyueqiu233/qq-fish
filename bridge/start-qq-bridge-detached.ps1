@@ -1,7 +1,7 @@
 # Runs the real starter and logs everything.
 # ASCII-only on purpose: Windows PowerShell 5.1 misreads UTF-8 (no BOM) scripts as ANSI.
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $here) { $here = $PSScriptRoot }
+if (-not $here) { $here = 'C:\Users\Lenovo\Documents\deepseek-harness\tools\qq-bridge\qq-bridge-main' }
 $log = Join-Path $here 'restart-detached.log'
 
 function Write-Log([string]$m) {

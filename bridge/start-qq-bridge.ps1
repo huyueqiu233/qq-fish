@@ -2,7 +2,7 @@ param([switch]$NoSnowLuma)
 $ErrorActionPreference = 'Stop'
 $bridgeDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $configPath = Join-Path $bridgeDir 'config.json'
-$snowDir = if ($env:SNOWLUMA_DIR) { $env:SNOWLUMA_DIR } else { Join-Path (Split-Path $PSScriptRoot -Parent) 'SnowLuma' }
+$snowDir = 'C:\Users\Lenovo\Documents\deepseek-harness\tools\SnowLuma'
 $node = 'C:\Program Files\nodejs\node.exe'
 
 function Find-DshPort {

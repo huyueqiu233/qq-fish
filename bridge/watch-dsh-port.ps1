@@ -63,8 +63,8 @@ elseif (-not $bridgeUp) { $needRestart = $true; $why = 'bridge not listening on 
 
 # 顺带看住本地克隆音色服务（9880）：挂了会退回机械音，所以直接拉起来
 try {
-    $cosyScript = if ($env:COSY_START) { $env:COSY_START } else { '' }
-    $cosyFlag = Join-Path $PSScriptRoot 'state\no-cosy.flag'
+    $cosyScript = 'C:\Users\Lenovo\dsh-tts\start-cosy-server.ps1'
+    $cosyFlag = Join-Path 'C:\Users\Lenovo\Documents\deepseek-harness\tools\qq-bridge\qq-bridge-main\state' 'no-cosy.flag'
     if ((Test-Path $cosyScript) -and -not (Test-Path $cosyFlag)) {
         $cosyUp = $false
         try { $cosyUp = (Test-NetConnection -ComputerName 127.0.0.1 -Port 9880 -WarningAction SilentlyContinue).TcpTestSucceeded } catch {}
@@ -79,7 +79,7 @@ try {
 
 # 看住 OneBot 网关（3000）：QQ 登录着但网关没跑时自动拉起（2026-11-04）
 try {
-    $snowDir = if ($env:SNOWLUMA_DIR) { $env:SNOWLUMA_DIR } else { Join-Path (Split-Path $PSScriptRoot -Parent) 'SnowLuma' }
+    $snowDir = 'C:\Users\Lenovo\Documents\deepseek-harness\tools\SnowLuma'
     if (Test-Path $snowDir) {
         $oneBotUp = $false
         try { $oneBotUp = (Test-NetConnection -ComputerName 127.0.0.1 -Port 3000 -WarningAction SilentlyContinue).TcpTestSucceeded } catch {}
@@ -115,7 +115,7 @@ try {
 
 # IndexTTS 语音服务（9881）：挂了就拉起（2026-11-06）
 try {
-    $itScript = if ($env:INDEXTTS_START) { $env:INDEXTTS_START } else { '' }
+    $itScript = 'C:\Users\Lenovo\dsh-tts\start-indextts-server.ps1'
     if (Test-Path $itScript) {
         $itUp = $false
         try { $itUp = (Test-NetConnection -ComputerName 127.0.0.1 -Port 9881 -WarningAction SilentlyContinue).TcpTestSucceeded } catch {}

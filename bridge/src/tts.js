@@ -26,17 +26,49 @@ export function createTts({
   indexttsRef = '',
   engine = 'auto',
   ffmpegPath = '',
+  cleanup = true,
   log = () => {},
 }) {
   const outDir = path.join(libraryDir, 'tts');
 
-  const KEY_VERSION = 'v4'; // 改合成策略就 +1，避免吃到旧缓存
-  function keyOf(text, voice, r, p, emotion = '', alpha = '') {
-    return createHash('sha1').update(`${KEY_VERSION}|${voice}|${r}|${p}|${emotion}|${alpha}|${text}`).digest('hex').slice(0, 16);
+  const KEY_VERSION = 'v5'; // 改合成策略就 +1，避免吃到旧缓存
+  function keyOf(text, voice, r, p, emotion = '', alpha = '', clean = false) {
+    return createHash('sha1').update(`${KEY_VERSION}|${voice}|${r}|${p}|${emotion}|${alpha}|${clean ? 'c1' : 'c0'}|${text}`).digest('hex').slice(0, 16);
+  }
+
+  /**
+   * 语气清理（2026-11-09 老板确认）：正常语气的语音过一遍 B 链——
+   * 降噪 + 压 3~7kHz 的硬感 + 9kHz 低通 + 响度归一。
+   * 带情绪的语音暂不处理（情绪靠高次谐波和亮度撑着，压了会发闷，等以后单独调）。
+   */
+  const CLEANUP_FILTER = [
+    'highpass=f=80',
+    'afftdn=nr=15:nf=-28',
+    'equalizer=f=3000:t=q:w=1:g=-3',
+    'equalizer=f=4800:t=q:w=1.2:g=-3',
+    'equalizer=f=7200:t=q:w=1.5:g=-2.5',
+    'lowpass=f=9000',
+    'loudnorm=I=-16:TP=-1.5:LRA=11'
+  ].join(',');
+
+  async function applyCleanup(absOut) {
+    const ff = ffmpegPath || 'ffmpeg';
+    const tmp = `${absOut}.clean.mp3`;
+    const code = await new Promise((resolve) => {
+      const child = spawn(ff, ['-y', '-loglevel', 'error', '-i', absOut, '-af', CLEANUP_FILTER, '-ar', '44100', '-ac', '1', '-b:a', '128k', tmp], { windowsHide: true });
+      child.on('close', (c) => resolve(c));
+      child.on('error', () => resolve(-1));
+    });
+    if (code === 0 && fs.existsSync(tmp) && fs.statSync(tmp).size > 0) {
+      fs.renameSync(tmp, absOut);
+      return true;
+    }
+    try { fs.unlinkSync(tmp); } catch {}
+    return false;
   }
 
   // ── CosyVoice2 本地服务（克隆音色）──────────────────────────────────
-  // 服务端：%USERPROFILE%\dsh-tts\cosy_server.py，默认 127.0.0.1:9880
+  // 服务端：C:\Users\Lenovo\dsh-tts\cosy_server.py，默认 127.0.0.1:9880
   // 不可用时静默返回 null，让上层退回 Edge/SAPI，绝不因为服务没起就把语音功能弄挂。
   async function tryCosy(text, absOut) {
     const base = String(cosyUrl || '').trim().replace(/\/+$/, '');
@@ -67,7 +99,7 @@ export function createTts({
 
 
   // ===== IndexTTS-2.5 本地服务（有情绪，2026-11-06）=====
-  // 服务端：%USERPROFILE%\dsh-tts\indextts_server.py，默认 127.0.0.1:9881
+  // 服务端：C:\Users\Lenovo\dsh-tts\indextts_server.py，默认 127.0.0.1:9881
   // 经验：情绪强度高了会把音色撑崩（听感是"破音"），所以 alpha 默认压到 0.3 左右；
   //       长句会越说越漂，按标点拆短分别合成，再用 ffmpeg 拼起来。
   function splitClauses(text) {
@@ -157,7 +189,10 @@ export function createTts({
     const voice = String(opts.voice || defaultVoice);
     const r = String(opts.rate || rate);
     const p = String(opts.pitch || pitch);
-    const id = keyOf(raw, voice, r, p, String(opts.emotion || ''), String(opts.alpha ?? ''));
+    // 带情绪的语音先不做清理（2026-11-09 决定），正常语气才过 B 链
+    const emotional = Boolean(opts.emotion) && Number(opts.alpha ?? 0.2) > 0;
+    const doClean = cleanup !== false && !emotional;
+    const id = keyOf(raw, voice, r, p, String(opts.emotion || ''), String(opts.alpha ?? ''), doClean);
     const rel = path.join('tts', `${id}.mp3`);
     const abs = path.join(outDir, `${id}.mp3`);
 
@@ -175,12 +210,24 @@ export function createTts({
       if (name === 'indextts') {
         if (!indexttsUrl) continue;
         const ok = await tryIndexTts(raw, abs, { emotion: opts.emotion, alpha: opts.alpha });
-        if (ok) return { file: rel.split(path.sep).join('/'), path: abs, bytes: fs.statSync(abs).size, cached: false, engine: 'indextts' };
+        if (ok) {
+          if (doClean) {
+            const cleaned = await applyCleanup(abs);
+            log(`[tts] 正常语气清理：${cleaned ? '已处理' : '失败，保留原音'}`);
+          }
+          return { file: rel.split(path.sep).join('/'), path: abs, bytes: fs.statSync(abs).size, cached: false, engine: 'indextts' };
+        }
         lastErr = 'IndexTTS 合成失败';
       } else if (name === 'cosy') {
         if (!cosyUrl) continue;
         const ok = await tryCosy(raw, abs);
-        if (ok) return { file: rel.split(path.sep).join('/'), path: abs, bytes: fs.statSync(abs).size, cached: false, engine: 'cosyvoice' };
+        if (ok) {
+          if (doClean) {
+            const cleaned = await applyCleanup(abs);
+            log(`[tts] 正常语气清理：${cleaned ? '已处理' : '失败，保留原音'}`);
+          }
+          return { file: rel.split(path.sep).join('/'), path: abs, bytes: fs.statSync(abs).size, cached: false, engine: 'cosyvoice' };
+        }
         lastErr = 'CosyVoice 合成失败';
       }
     }

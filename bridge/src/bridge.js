@@ -43,6 +43,8 @@ import {
   saveSlang,
   upsertSlangEntry,
   buildSlangContext,
+  matchSlangEntries,
+  formatSlangBlock,
   buildExtractionPrompt,
   buildResearchPrompt,
   parseExtractionJson,
@@ -718,6 +720,17 @@ function loadConfig() {
       learnerPreset: 'qq-chat',
       workspaceTitle: 'QQ 黑话学习',
       autoResearch: true,
+      autoConfirm: true,          // 研究完成的词条自动转正（控制台确认按钮实际没人点）
+      autoConfirmMinCount: 2,
+      turnTimeoutMs: 180000,      // 提取一轮最多等多久（原来 120s，实测常被截断）
+      researchTimeoutMs: 300000,  // 研究一轮要联网查证，更慢（实测 2-3 分钟）
+      researchBacklog: true,      // 空闲时补课：把没研究过的候选按出现次数慢慢研究掉
+      researchBatch: 3,           // 补课一轮研究几个
+      researchBacklogIntervalMs: 180000, // 补课间隔（默认 3 分钟）
+      researchMinCount: 2,        // 只研究出现过 >=2 次的词（一次性出现的没价值）
+      researchMaxAttempts: 2,     // 同一个词最多补课研究几次
+      researchRetryMs: 43200000,  // 两次补课之间至少隔 12 小时
+      stickyMs: 600000,           // 梗触发后保持 10 分钟（Sticky）
       ...(file.slang ?? {})
     },
     social: {
@@ -856,7 +869,9 @@ function loadConfig() {
         checkIntervalMinMs: 30 * 60 * 1000,
         checkIntervalMaxMs: 90 * 60 * 1000,
         idleThresholdMs: 15 * 60 * 1000,
-        probability: 0.3
+        probability: 0.3,
+        dailyMax: 4,                  // 每天最多主动几次（硬闸，按自然日）
+        minGapMs: 90 * 60 * 1000      // 两次主动之间至少隔多久（硬闸）
       },
       feedback: {
         maxLength: 500,
@@ -1250,7 +1265,9 @@ function getTts() {
       indexttsUrl: vc.tts?.indexttsUrl || '',
       indexttsRef: vc.tts?.indexttsRef || '',
       engine: vc.tts?.engine || 'auto',
-      ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
+      // 正常语气的语音过一遍清理链；带情绪的不过（2026-11-09 决定）
+      cleanup: vc.tts?.cleanup !== false,
+      ffmpegPath: process.env.FFMPEG_PATH || 'C:\\Users\\Lenovo\\.dsh\\tools\\ffmpeg\\bin\\ffmpeg.exe',
       log,
     });
   }
@@ -1473,6 +1490,8 @@ async function main() {
     slangStoreWritable = false;
     log(`⚠️ 黑话库加载失败，已暂停写入以免覆盖磁盘数据（修好后重启即可恢复）：${error?.message ?? error}`);
   }
+  // 研究完成的词条自动进表（2026-11-08）：以前全停在 candidate，注入永远是空的。
+  autoConfirmSlang('启动');
   const slangWindows = new Map();       // key -> [{sender,text,time}]：待学习消息窗口
   const slangExtractionCooldowns = new Map(); // key -> timestamp
   const slangSubmitTimes = new Map();   // key -> [timestamp]：AI 提交黑话候选限频（内存态）
@@ -2138,6 +2157,34 @@ async function main() {
     return { emojiId, entry: entry || null, remark: cleanRemark };
   }
 
+  /**
+   * 自动确认：研究完成（有释义/用法/例句）且出现 ≥2 次的候选直接转正。
+   *
+   * 为什么需要：确认入口在控制台，实际没人点 —— 710 条全停在 candidate，而
+   * buildSlangContext 只认 confirmed，于是黑话表一直是空的（2026-11-08 发现）。
+   * 保守起见只放行「研究过」的条目：没解释、没例句的半成品继续留在候选库。
+   */
+  function autoConfirmSlang(reason = '') {
+    if (cfg.slang?.autoConfirm === false) return 0;
+    if (!slangStoreWritable) return 0;
+    const min = Math.max(1, Number(cfg.slang?.autoConfirmMinCount) || 2);
+    let n = 0;
+    for (const e of slangEntries) {
+      if (e.status !== SLANG_STATUS.CANDIDATE) continue;
+      if (!e.content || !e.meaning || !e.usage || !e.example) continue;
+      if ((Number(e.count) || 0) < min) continue;
+      e.status = SLANG_STATUS.CONFIRMED;
+      e.confirmedAt = new Date().toISOString();
+      e.confirmedBy = 'auto';
+      n += 1;
+    }
+    if (n > 0) {
+      saveSlangStore();
+      log(`黑话：自动确认 ${n} 条研究完成的词条（${reason}）`);
+    }
+    return n;
+  }
+
   function saveSlangStore() {
     if (!slangStoreWritable) {
       log('⚠️ 黑话库处于只读降级状态（启动时加载失败），本次改动不落盘');
@@ -2204,6 +2251,9 @@ async function main() {
       learnerSessions.delete(oldId);
     }
     try { fs.unlinkSync(SLANG_SESSION_FILE); } catch {}
+    // 顺手归档旧会话：不归档的话它们会一直堆在 DSH 的会话列表里（11-08 老板问起，
+    // 当时列表里积了 10 个）。先停 DSH 侧排队的工作再归档，和别的退役路径一致。
+    if (oldId) stopRetiredSessionWork(oldId, 'internal:黑话学习');
   }
 
   function waitLearnerTurn(sessionId, timeoutMs = 120000) {
@@ -2244,7 +2294,7 @@ async function main() {
         log(`黑话提取被拒 (${key}): ${accepted.result.error.code}: ${accepted.result.error.message}`);
         return;
       }
-      const output = await waitLearnerTurn(sessionId);
+      const output = await waitLearnerTurn(sessionId, Number(cfg.slang?.turnTimeoutMs) || 180000);
       const items = parseExtractionJson(output);
       if (!items.length) {
         log(`黑话提取：${key} 未发现候选`);
@@ -2307,7 +2357,7 @@ async function main() {
         log(`黑话研究被拒: ${accepted.result.error.code}: ${accepted.result.error.message}`);
         return;
       }
-      const output = await waitLearnerTurn(sessionId);
+      const output = await waitLearnerTurn(sessionId, Number(cfg.slang?.researchTimeoutMs) || 300000);
       const results = parseResearchJson(output);
       for (const r of results) {
         const entry = slangEntries.find((e) => e.content === r.content);
@@ -2326,7 +2376,14 @@ async function main() {
         entry.lastInferenceCount = entry.count;
         entry.updatedAt = new Date().toISOString();
       }
+      // 记一次研究尝试：未确认的词不能每轮都重新研究（否则同样的词反复烧钱，2026-11-09）
+      const nowIso = new Date().toISOString();
+      for (const e of targets) {
+        e.researchAttempts = (Number(e.researchAttempts) || 0) + 1;
+        e.lastResearchAt = nowIso;
+      }
       saveSlangStore();
+      autoConfirmSlang('研究完成');
       log(`黑话研究：已更新 ${results.length} 条候选解释`);
     } catch (error) {
       if (/会话|session|not found|404/i.test(String(error?.message ?? error))) {
@@ -2410,15 +2467,94 @@ async function main() {
       .map(publicSlangEntry);
   }
 
-  function withSlangContext(promptText) {
-    const now = new Date();
-    const timeLine = `【当前时间】${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`;
-    const parts = [timeLine];
-    if (cfg.slang?.enabled !== false) {
-      const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8);
-      if (block) parts.push(block);
+  /** 这个会话最近在聊什么（给黑话匹配用）。v2 用 conversations，一代用 social.recentMessages。 */
+  function recentTextForSlang(key) {
+    if (!key) return '';
+    const st = socialV2.conversations.get(key);
+    const msgs = (st && Array.isArray(st.recentMessages) && st.recentMessages.length
+      ? st.recentMessages
+      : social.recentMessages.get(key)) || [];
+    return msgs
+      .slice(-12)
+      .map((m) => String(m?.plain ?? m?.text ?? ''))
+      .join('\n')
+      .slice(0, 4000);
+  }
+
+  /** key -> { list, until }：最近触发过的梗，保持一小段时间（Sticky）。 */
+  const slangSticky = new Map();
+
+  function withSlangContext(promptText, key = '') {
+    if (cfg.slang?.enabled === false) return promptText;
+    const max = cfg.slang?.injectMax ?? 8;
+    const corpus = recentTextForSlang(key);
+    // 只注入「这一段对话里真的出现」的词条；没命中就不注入（2026-11-08）
+    let list = matchSlangEntries(slangEntries, max, corpus);
+    let matchedNow = list.length > 0;
+
+    // Sticky：命中过的梗保持一小段时间，聊到一半换话题也不会突然忘（2026-11-09）
+    const stickyMs = Math.max(0, Number(cfg.slang?.stickyMs ?? 10 * 60 * 1000));
+    const now = Date.now();
+    if (stickyMs > 0) {
+      if (matchedNow) {
+        slangSticky.set(key, { list: list.slice(0, Math.min(3, max)), until: now + stickyMs });
+      } else {
+        const sticky = slangSticky.get(key);
+        if (sticky && sticky.until > now) {
+          list = sticky.list;
+        } else if (sticky) {
+          slangSticky.delete(key);
+        }
+      }
     }
-    return parts.join('\n\n') + '\n\n' + promptText;
+
+    const block = formatSlangBlock(list, matchedNow ? corpus : (list.length ? 'sticky' : ''));
+    return block ? block + '\n\n' + promptText : promptText;
+  }
+
+  /**
+   * 把「当前状态」贴到提示词最末尾（2026-11-08）。
+   *
+   * 参考 SillyTavern 的 Author's Note：越靠近对话末尾，对下一句的影响越大。
+   * 时间、她上次说到哪、最近几句在聊什么，这几行放最后比堆在最前面更容易被用上。
+   */
+  /**
+   * 「说话方式」块：只用统计出来的差距，不写虚的（2026-11-14）。
+   *
+   * 数据依据（7 天群聊，她 1984 条 vs 群友 6994 条）：
+   *   句长中位数 14 vs 9；问号收尾 1% vs 4%；@/引用 0% vs 22%；句号 0% vs 1%。
+   * 所以只补三件事：更短、偶尔反问、要接具体某条时用引用。
+   * 只注入群聊，私聊保持原样。
+   */
+  function withStyleRules(promptText, key = '') {
+    if (cfg.style?.rules === false) return promptText;
+    if (!String(key).startsWith('group:')) return promptText;
+    const block = [
+      '【说话方式】',
+      '- 一次回 1~3 条，每条尽量 20 字内；长了拆成几条发，别写成一段。',
+      '- 不用句号收尾，少用书面词；别用"首先/其次/总之/综上所述/建议你"这类腔调。',
+      '- 先接梗、接情绪，再答内容；能顺着对方的话往下聊就别另起一个答案。',
+      '- 要回应某条具体消息（被点名、被问、接上一句）时，用 replyToMessageId 引用那一条；普通接话不引用。',
+      '- 偶尔反问一句把话头抛回去，别每条都问。',
+      '- 看到带图/表情包的消息：先接图里的梗（画面、图上的字），别绕回文字话题。'
+    ].join('\n');
+    return block + '\n\n' + promptText;
+  }
+
+  function withTailStatus(promptText, key = '') {
+    if (!key) return promptText;
+    const now = new Date();
+    const lines = [`时间：${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`];
+    const st = socialV2.conversations.get(key);
+    if (st?.handoff?.text) {
+      lines.push(`她上次聊到：${String(st.handoff.text).replace(/\n+/g, ' / ').slice(0, 300)}`);
+    }
+    const recent = recentTextForSlang(key);
+    if (recent) {
+      const last = recent.split('\n').filter(Boolean).slice(-3).join(' / ').slice(0, 200);
+      if (last) lines.push(`最近几句：${last}`);
+    }
+    return `${promptText}\n\n【当前状态】\n${lines.join('\n')}`;
   }
 
   if (!cfg.allow.private.length && !cfg.allow.groups.length && cfg.allowAllWhenEmpty) {
@@ -2981,6 +3117,35 @@ async function main() {
           biliTickerStarted = true;
           setInterval(tickBiliDaily, 60 * 1000).unref?.();
 
+        // ── 黑话研究补课：阈值触发之外，空闲时把积压的候选按出现次数慢慢研究掉（2026-11-08）──
+        if (!slangBacklogStarted && cfg.slang?.autoResearch !== false && cfg.slang?.researchBacklog !== false) {
+          slangBacklogStarted = true;
+          setInterval(() => {
+            try {
+              if (!dshReady) return;
+              if (learnerWaiters.size > 0 || learnerCollectors.size > 0) return;
+              if (slangResearchingIds.size > 0) return;
+              const batch = Math.max(1, Math.min(8, Number(cfg.slang?.researchBatch) || 3));
+              // 只研究出现过至少 N 次的词：一次性出现的词研究出来也没用，纯烧钱（2026-11-09）
+              const minCount = Math.max(1, Number(cfg.slang?.researchMinCount) || 2);
+              // 同一个词最多补课研究几次、两次之间隔多久（未确认的词别每轮重来）
+              const maxAttempts = Math.max(1, Number(cfg.slang?.researchMaxAttempts) || 2);
+              const retryMs = Math.max(0, Number(cfg.slang?.researchRetryMs) || 12 * 3600 * 1000);
+              const nowMs = Date.now();
+              const targets = slangEntries
+                .filter((e) => e.status === SLANG_STATUS.CANDIDATE && !e.meaning
+                  && !slangResearchingIds.has(e.id) && (Number(e.count) || 0) >= minCount
+                  && (Number(e.researchAttempts) || 0) < maxAttempts
+                  && (!e.lastResearchAt || nowMs - Date.parse(e.lastResearchAt) > retryMs))
+                .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0))
+                .slice(0, batch);
+              if (!targets.length) return;
+              queueSlangTask(() => runSlangResearch(targets));
+            } catch (error) {
+              log('黑话研究补课异常:', error?.message ?? error);
+            }
+          }, Math.max(60_000, Number(cfg.slang?.researchBacklogIntervalMs) || 180_000)).unref?.();
+        }
         // ── 每天一次"自省"唤醒（记忆链 P4）──
         let reflectTimerStarted = false;
         function startReflectTimer() {
@@ -3127,7 +3292,7 @@ async function main() {
 
           setTimeout(tickBiliDaily, 5000).unref?.();
         }
-        // 精力：启动时补满（计数窗口不动，分钟/小时限额仍跨重启保留）——2026-11-01 某群规则
+        // 精力：启动时补满（计数窗口不动，分钟/小时限额仍跨重启保留）——2026-11-01 群 530148220 规则
         try {
           let resetCount = 0;
           for (const [ckey, cst] of socialV2.conversations.entries()) {
@@ -4734,7 +4899,7 @@ async function main() {
           // proactive：主动机会参数
           if (body.proactive && typeof body.proactive === 'object') {
             merged.proactive = { ...(current.proactive ?? {}), ...body.proactive };
-            for (const k of ['checkIntervalMinMs', 'checkIntervalMaxMs', 'idleThresholdMs', 'probability']) {
+            for (const k of ['checkIntervalMinMs', 'checkIntervalMaxMs', 'idleThresholdMs', 'probability', 'dailyMax', 'minGapMs']) {
               if (merged.proactive[k] !== undefined) {
                 const n = Number(merged.proactive[k]);
                 merged.proactive[k] = Number.isFinite(n) ? n : current.proactive?.[k] ?? 0;
@@ -6749,7 +6914,9 @@ async function main() {
           }
           try {
             const data = await bot.raw('get_forward_msg', { id });
-            const formatted = formatForwardResponse(data);
+            const fwdOffset = Math.max(0, Math.floor(Number(url.searchParams.get('offset') || 0)) || 0);
+            const fwdLimit = Math.min(300, Math.max(1, Number(url.searchParams.get('limit') || 0) || 100));
+            const formatted = formatForwardResponse(data, { offset: fwdOffset, maxMessages: fwdLimit });
             const remember = (fid) => {
               if (!fid) return;
               let set = seenForwardIds.get(key);
@@ -6769,32 +6936,48 @@ async function main() {
             for (const m of formatted.messages || []) {
               for (const fid of m.nestedForwardIds || []) remember(fid);
             }
-            // 抓取嵌套转发的前几条作为预览，让 AI 不需要二次调用也能先看到内容。
-            const nestedPreviews = [];
-            const nestedIds = [];
+            // 递归展开嵌套转发（聊天记录套聊天记录），最多 3 层，带总量上限
             const seenNested = new Set();
+            const expandForward = async (fid, depth, budget) => {
+              const d = await bot.raw('get_forward_msg', { id: fid });
+              const f = formatForwardResponse(d, { maxMessages: depth === 0 ? 60 : 20, maxCharsPerMessage: 160 });
+              budget.chars += JSON.stringify(f.messages || []).length;
+              budget.count += 1;
+              const node = { id: fid, depth, messages: f.messages || [], nested: [] };
+              if (depth >= 3 || budget.chars > 6000 || budget.count > 150) return node;
+              const ids = [];
+              for (const m of node.messages) {
+                for (const nid of m.nestedForwardIds || []) {
+                  if (!seenNested.has(nid) && ids.length < 5) { seenNested.add(nid); ids.push(nid); }
+                }
+              }
+              for (const nid of ids) {
+                if (budget.chars > 6000 || budget.count > 150) break;
+                try {
+                  remember(nid);
+                  node.nested.push(await expandForward(nid, depth + 1, budget));
+                } catch (error) {
+                  node.nested.push({ id: nid, error: error?.message ?? '嵌套转发读取失败' });
+                }
+              }
+              return node;
+            };
+            const tree = [];
+            const rootIds = [];
             for (const m of formatted.messages || []) {
               for (const fid of m.nestedForwardIds || []) {
-                if (!seenNested.has(fid) && nestedIds.length < 5) {
-                  seenNested.add(fid);
-                  nestedIds.push(fid);
-                }
+                if (!seenNested.has(fid) && rootIds.length < 5) { seenNested.add(fid); rootIds.push(fid); }
               }
             }
-            for (const fid of nestedIds) {
+            for (const fid of rootIds) {
               try {
-                const ndata = await bot.raw('get_forward_msg', { id: fid });
-                const nfmt = formatForwardResponse(ndata, { maxMessages: 3, maxCharsPerMessage: 120 });
-                for (const nm of nfmt.messages || []) {
-                  for (const nfid of nm.nestedForwardIds || []) remember(nfid);
-                }
-                nestedPreviews.push({ id: fid, ...nfmt });
+                remember(fid);
+                tree.push(await expandForward(fid, 1, { chars: 0, count: 0 }));
               } catch (error) {
-                log(`嵌套转发预览失败 ${key} ${fid}:`, error?.message ?? error);
-                nestedPreviews.push({ id: fid, error: error?.message ?? '嵌套转发读取失败' });
+                tree.push({ id: fid, error: error?.message ?? '嵌套转发读取失败' });
               }
             }
-            sendJson({ ok: true, key, id, ...formatted, nestedPreviews });
+            sendJson({ ok: true, key, id, ...formatted, nested: tree });
           } catch (error) {
             log(`合并转发查询失败 ${key} ${id}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `合并转发查询失败：${error?.message ?? error}` }, 500);
@@ -7091,7 +7274,17 @@ async function main() {
             meaning: body.meaning ? String(body.meaning).slice(0, 160) : null
           });
           if (!res.ok) { sendJson(res, 400); return; }
-          sendJson({ ok: true, id: res.record.id, title: res.record.title, kind: res.record.kind, priority: res.record.priority });
+          sendJson({
+            ok: true,
+            id: res.record.id,
+            title: res.record.title,
+            kind: res.record.kind,
+            priority: res.record.priority,
+            // 冲突检测：这条把哪些旧记忆顶掉了（可 unmerge 恢复）
+            ...(Array.isArray(res.superseded) && res.superseded.length
+              ? { replaced: res.superseded.map((r) => `${r.id}:${r.title}`) }
+              : {})
+          });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/memory/unmerge') {
@@ -7795,19 +7988,45 @@ async function main() {
     });
 
     // ── 上下文守门：超过阈值且空闲 → 只换 DSH 会话，不删会话状态 ──
+    // key → 上次据此换会话的样本时间。换完之后那一条样本还留在账本里，不记住就会
+    // 每 5 分钟拿同一个旧数字再换一次（2026-11-08 修）。
+    const guardDoneAt = new Map();
     setInterval(() => {
       try {
         const g = { enabled: true, maxTokens: 250000, minIdleMs: 600000, ...(cfg.socialV2?.contextGuard ?? {}) };
         if (g.enabled === false || currentMode !== 'reserved2') return;
         // 每个会话取最新一条：recent(N) 会被活跃群聊挤满，私聊永远排不进来（2026-11-05 修）
+        // 注意同一 key 会留下多条**死会话**的样本，必须按时间取最新那条。以前写成
+        // first-wins，取到的是最早插入的旧会话 —— 11-07 私聊那个 258K、黑话那个 322K
+        // 都是已经退役的会话，结果每安静 10 分钟就把当前会话再清一次。
         const recent = tokenLedger.latestBySession();
         const lastByKey = new Map();
         for (const r of recent) {
-          if (!r?.key || lastByKey.has(r.key)) continue;
-          lastByKey.set(r.key, r);
+          if (!r?.key) continue;
+          const prev = lastByKey.get(r.key);
+          if (!prev || (Number(r.time) || 0) > (Number(prev.time) || 0)) lastByKey.set(r.key, r);
         }
         for (const [key, sample] of lastByKey) {
           const size = Number(sample.cacheHit) || 0;
+          const sampleAt = Number(sample.time) || 0;
+          // 这一条样本已经据此换过会话了：它不会自己消失，别再拿它反复触发
+          if (sampleAt <= (guardDoneAt.get(key) ?? 0)) continue;
+          // 黑话学习是内部会话，不在 state.sessions / conversations 里，单独管（2026-11-07）
+          if (key === 'internal:黑话学习') {
+            const slangMax = Number(cfg.slang?.sessionMaxTokens) || 120000;
+            if (size < slangMax) continue;
+            if (Date.now() - sampleAt < g.minIdleMs) continue;
+            if (learnerWaiters.size > 0 || learnerCollectors.size > 0) continue;
+            try {
+              guardDoneAt.set(key, sampleAt);
+              invalidateSlangLearnerSession();
+              log(`[guard] 黑话学习会话 ${Math.round(size / 1000)}K > ${Math.round(slangMax / 1000)}K，已丢弃旧会话（下个学习任务会新建）`);
+              appendActivity(`[guard] 黑话学习上下文过大，已换新会话`);
+            } catch (error) {
+              log(`[guard] 黑话学习重置失败：${error?.message ?? error}`);
+            }
+            continue;
+          }
           if (size < g.maxTokens) continue;
           if (!state.sessions[key]) continue;
           // 私聊也管（2026-11-05）：不 reset 会一路涨到 DSH 上限，反而更糟；
@@ -7825,6 +8044,7 @@ async function main() {
               if (text) { st.handoff = { text, at: Date.now() }; saveSocialV2State(); }
             }
           } catch (error) { log(`[guard] 写前情提要失败：${error?.message ?? error}`); }
+          guardDoneAt.set(key, sampleAt);
           fetch(`http://127.0.0.1:${port}/api/session/reset`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-console-token': consoleToken },
@@ -7853,6 +8073,53 @@ async function main() {
 
   // 会话代际：reset/清空工作区时递增，防止在途 ensureSession 把旧会话"复活"
   let sessionEpoch = 0;
+
+  // ── 聊天复盘归档（2026-11-08）─────────────────────────────────────────────
+  // 把每个会话里「她说的话 + 群友的后续反应」按时序追加到 state/review/YYYY-MM-DD.jsonl。
+  // 只读内存里的 recentMessages，不额外请求 DSH、不增加 token；复盘时用
+  // scripts/review-report.mjs 统计「被接住 / 冷场」。
+  const REVIEW_DIR = path.join(STATE_DIR, 'review');
+  const REVIEW_CURSOR_FILE = path.join(REVIEW_DIR, '_cursor.json');
+  let reviewCursor = {};
+  try {
+    reviewCursor = JSON.parse(fs.readFileSync(REVIEW_CURSOR_FILE, 'utf8')) || {};
+  } catch { reviewCursor = {}; }
+
+  function exportReviewTick() {
+    try {
+      const day = new Date().toLocaleDateString('sv-SE');
+      const dayStart = new Date(`${day}T00:00:00`).getTime();
+      const out = [];
+      for (const [key, st] of socialV2.conversations) {
+        const msgs = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+        // 第一次跑没有游标：只导今天，别把昨天积压的 recentMessages 也算进来
+        const last = Number(reviewCursor[key]) || dayStart;
+        let maxT = last;
+        for (const m of msgs) {
+          const t = Number(m.time) || 0;
+          if (!t || t <= last) continue;
+          out.push(JSON.stringify({
+            t,
+            key,
+            self: m.isSelf === true,
+            sender: String(m.sender ?? ''),
+            text: String(m.plain ?? m.text ?? '').slice(0, 500),
+            quoteSelf: m.quoteTargetIsSelf === true
+          }));
+          if (t > maxT) maxT = t;
+        }
+        if (maxT > last) reviewCursor[key] = maxT;
+      }
+      if (!out.length) return;
+      fs.mkdirSync(REVIEW_DIR, { recursive: true });
+      fs.appendFileSync(path.join(REVIEW_DIR, `${day}.jsonl`), `${out.join('\n')}\n`, 'utf8');
+      fs.writeFileSync(REVIEW_CURSOR_FILE, JSON.stringify(reviewCursor), 'utf8');
+    } catch (error) {
+      log(`复盘归档失败：${error?.message ?? error}`);
+    }
+  }
+  setInterval(exportReviewTick, 5 * 60 * 1000).unref?.();
+  setTimeout(exportReviewTick, 20 * 1000).unref?.();
 
   // 待应答的提问/审批：convKey -> pending
   const pending = new Map(); // key -> { kind, rpcId, sessionId, ... }
@@ -9004,6 +9271,7 @@ async function main() {
 
   // ── 二代仿真模式（reserved2）运行时状态与唤醒配置 ────────────────────────
   let biliTickerStarted = false;
+  let slangBacklogStarted = false;
   const socialV2 = {
     conversations: new Map(), // key -> state
     paused: false, // 控制台可暂停整个二代 AI 活动（停止唤醒/等待）
@@ -10014,10 +10282,10 @@ async function main() {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get(what="unread")(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_set_wake_config（一次搞定已读+唤醒） 的 throughSeq；新到消息留待处理。`;
       }
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    let content = [{ type: 'text', text: withStyleRules(withTailStatus(withSlangContext(promptText, key), key), key) }];
     if (Array.isArray(opts.media) && opts.media.length > 0) {
       const imageParts = await resolveMediaList(opts.media);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      content = [{ type: 'text', text: withStyleRules(withTailStatus(withSlangContext(promptText, key), key), key) }, ...imageParts];
     }
     // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
@@ -11873,7 +12141,29 @@ ${lines || '- （没有了，可能是并发清扫）'}
       const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;
-      if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
+
+      // ── 硬闸（2026-11-08）──────────────────────────────────────────────
+      // 上面那些只是「软化概率」，真正防烦人的是这几条：命中就跳过这一拍，
+      // 别让概率在夜里/冷场时被凑巧放大。参考「心跳插件」的五道闸。
+      const counters = st.proactiveCounters ?? (st.proactiveCounters = { day: '', count: 0, lastAt: 0 });
+      const dayKey = new Date().toLocaleDateString('sv-SE'); // 本地时区的 YYYY-MM-DD
+      if (counters.day !== dayKey) { counters.day = dayKey; counters.count = 0; }
+      const dailyMax = Math.max(1, Number(p.dailyMax) || 4);
+      const minGapMs = Math.max(0, Number(p.minGapMs ?? 90 * 60 * 1000));
+      let blockWhy = '';
+      let restGate = { allowed: true };
+      try { restGate = rest.mayWake('proactiveCheck'); } catch {}
+      if (!restGate.allowed) blockWhy = `她在休息（${restGate.why || '夜里'}）`;
+      else if (counters.count >= dailyMax) blockWhy = `今天主动 ${counters.count} 次，已到上限`;
+      else if (counters.lastAt && Date.now() - counters.lastAt < minGapMs) blockWhy = `距上次主动不到 ${Math.round(minGapMs / 60000)} 分钟`;
+      else if (st.lastAiReplyAt && Number(st.lastAiReplyAt) > Number(st.lastIncomingAt || 0)) blockWhy = '上一条还没人接，不追';
+      else if (idle < idleThreshold) blockWhy = '群里刚说过话';
+      else if (isConversationBusyV2(key, st)) blockWhy = '对话正忙';
+      if (blockWhy) {
+        log(`[reserved2] 主动机会 ${key} 跳过：${blockWhy}`);
+      } else if (Math.random() < prob) {
+        counters.count += 1;
+        counters.lastAt = Date.now();
         void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
       }
       scheduleProactiveCheckV2(key);
@@ -11991,9 +12281,10 @@ ${lines || '- （没有了，可能是并发清扫）'}
       return;
     }
 
-    // 控制类话语：仅管理员（ownerQQ）可下达；群友触发直接拦截
+    // 控制类话语：仅管理员（ownerQQ）可下达；群友触发直接静默拦截（2026-11-09 老板要求不回复）
     if (!isOwner && /进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(plainContent)) {
-      await sendToQQ(key, '角色切换仅管理员可在管理端操作，群内不支持。');
+      appendActivity(`${key}（角色话术拦截）群友 ${event.user_id}：${plainContent.slice(0, 60)}`);
+      log(`非管理员角色话术已丢弃 ${key}`);
       return;
     }
 
@@ -12002,7 +12293,9 @@ ${lines || '- （没有了，可能是并发清扫）'}
     const cmdText = plainContent.replace(/^(\s*@[^\s]+\s*)+/u, '').trim();
     if (cmdText.startsWith('/')) {
       if (!isOwner) {
-        await sendToQQ(key, '管理命令仅管理员可用。');
+        // 群友发管理命令：直接静默丢弃，不回「仅管理员可用」（2026-11-09 老板要求）
+        appendActivity(`${key}（命令拦截）群友 ${event.user_id}：${cmdText.slice(0, 60)}`);
+        log(`非管理员命令已丢弃 ${key}: ${cmdText.slice(0, 40)}`);
         return;
       }
       if (plainContent === '/reset' || plainContent === '/new') {
@@ -12285,10 +12578,10 @@ ${lines || '- （没有了，可能是并发清扫）'}
       }
       throw error;
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    let content = [{ type: 'text', text: withStyleRules(withTailStatus(withSlangContext(promptText, key), key), key) }];
     if (Array.isArray(mediaList) && mediaList.length > 0) {
       const imageParts = await resolveMediaList(mediaList);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      content = [{ type: 'text', text: withStyleRules(withTailStatus(withSlangContext(promptText, key), key), key) }, ...imageParts];
     }
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     const accepted = await api.sessions.prompt({

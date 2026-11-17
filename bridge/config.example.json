@@ -1,16 +1,16 @@
 {
   "dsh": {
     "baseUrl": "http://127.0.0.1:3080",
-    "provider": "deepseek-account",
+    "provider": "deepseek-official",
     "model": "deepseek-flash",
-    "reasoningEffort": "high",
+    "reasoningEffort": "max",
     "authToken": "",
     "authHeader": "authorization",
     "authPrefix": "Bearer",
     "allowRemote": false
   },
   "role": {
-    "maxInjectChars": 7800
+    "maxInjectChars": 6000
   },
   "snowluma": {
     "wsUrl": "ws://127.0.0.1:3001",
@@ -87,8 +87,8 @@
     "idleRetryProbability": 0.4,
     "proactiveEnabled": true,
     "proactiveIdleThresholdMs": 1800000,
-    "proactiveCheckMinMs": 1800000,
-    "proactiveCheckMaxMs": 2700000,
+    "proactiveCheckMinMs": 2700000,
+    "proactiveCheckMaxMs": 5400000,
     "proactiveProbability": 0.2,
     "activeReplyDelayMinMs": 1000,
     "activeReplyDelayMaxMs": 5000,
@@ -140,12 +140,12 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": true
+      "sendVoice": false
     },
     "wake": {
       "defaultMode": "diving",
       "preSleepWaitEnabled": true,
-      "preSleepWaitMs": 120000,
+      "preSleepWaitMs": 300000,
       "staleChatMinutes": 10,
       "staleSilentMinutes": 120,
       "recommendedDefaultInfinite": true,
@@ -177,7 +177,7 @@
       "recommendedQuestion": true,
       "recommendedPoke": true,
       "recommendedHint": "如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息概率 0.05；@/名字/关键词/提问唤醒建议保持开启。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
-      "batchWindowMs": 5000,
+      "batchWindowMs": 8000,
       "maxWakePerMinute": 1,
       "maxWakePerHour": 12,
       "noActionLimit": 3,
@@ -203,8 +203,8 @@
       "defaultMs": 30000,
       "minMs": 5000,
       "maxMs": 600000,
-      "defaultQuietMs": 5000,
-      "minQuietAfterNewMs": 5000
+      "defaultQuietMs": 8000,
+      "minQuietAfterNewMs": 10000
     },
     "sticker": {
       "enabled": true,
@@ -220,27 +220,17 @@
       }
     },
     "voice": {
-      "enabled": true,
+      "enabled": false,
       "dir": "audio",
       "maxSeconds": 300,
       "maxBytes": 20971520,
-      "maxPerMinute": 6,
-      "maxPerHour": 40,
+      "maxPerMinute": 2,
+      "maxPerHour": 10,
       "allowAbsolutePath": false,
       "defaultVolume": 1,
       "loudness": "normal",
       "ffmpegPath": "",
-      "autoReadback": true,
-      "tts": {
-        "pythonPath": "",
-        "voice": "zh-CN-XiaoyiNeural",
-        "rate": "+0%",
-        "pitch": "+0Hz",
-        "cosyUrl": "http://127.0.0.1:9880",
-        "engine": "auto",
-        "indexttsUrl": "http://127.0.0.1:9881",
-        "indexttsRef": ""
-      }
+      "autoReadback": true
     },
     "proactive": {
       "enabled": true,
@@ -273,69 +263,7 @@
       "gifFrames": 6,
       "gifTile": 240,
       "normalizeTimeoutMs": 25000
-    },
-    "energy": {
-      "enabled": true,
-      "groups": [],
-      "cap": 100,
-      "costPerMessage": 1,
-      "tiredBelow": 20,
-      "restorePerHour": 30,
-      "maxPerMinute": 5,
-      "maxPerHour": 20,
-      "resetOnStart": true
-    },
-    "biliDaily": {
-      "enabled": true,
-      "key": "private:0",
-      "windowStart": "20:00",
-      "windowEnd": "22:00"
-    },
-    "contextGuard": {
-      "enabled": true,
-      "maxTokens": 250000,
-      "minIdleMs": 600000,
-      "includePrivate": true
-    },
-    "reflect": {
-      "enabled": true,
-      "hour": 23,
-      "minute": 0,
-      "spreadMin": 40,
-      "minMsgs": 5
-    },
-    "mood": {
-      "enabled": true,
-      "baseline": 65,
-      "sensitivity": "medium"
-    },
-    "rest": {
-      "enabled": true,
-      "startHour": 23.5,
-      "endHour": 8
-    },
-    "asr": {
-      "enabled": false,
-      "python": "",
-      "script": "scripts/asr.py",
-      "model": "base",
-      "timeoutMs": 30000
-    },
-    "curiosity": {
-      "enabled": true,
-      "startHour": 19,
-      "endHour": 22
-    },
-    "digest": {
-      "enabled": true,
-      "everyMessages": 50
-    },
-    "personaReview": {
-      "enabled": true,
-      "day": 1,
-      "hour": 10
-    },
-    "ownerGroups": []
+    }
   },
   "webSearch": {
     "provider": "auto",

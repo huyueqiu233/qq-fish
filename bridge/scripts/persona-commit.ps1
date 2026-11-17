@@ -11,7 +11,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$roles = Join-Path (Split-Path $PSScriptRoot -Parent) 'roles'
+$roles = 'C:\Users\Lenovo\Documents\deepseek-harness\tools\qq-bridge\qq-bridge-main\roles'
 
 if (-not (Test-Path (Join-Path $roles '.git'))) {
     Write-Host "不是 git 仓库：$roles"

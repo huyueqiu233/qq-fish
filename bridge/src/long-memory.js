@@ -48,6 +48,8 @@ export function createLongMemory({ root, log = () => {} }) {
     event: path.join(dir, 'events.jsonl'),
     fact: path.join(dir, 'facts.jsonl'),
     selfnote: path.join(dir, 'selfnotes.jsonl'),
+    impression: path.join(dir, 'impressions.jsonl'),
+    archive: path.join(dir, 'archive.jsonl'),
   };
   const indexFile = path.join(dir, 'index.json');
 
@@ -59,6 +61,7 @@ export function createLongMemory({ root, log = () => {} }) {
     index.clear();
     seq = 0;
     for (const [kind, file] of Object.entries(files)) {
+      if (kind === 'archive') continue;
       if (!fs.existsSync(file)) continue;
       const lines = fs.readFileSync(file, 'utf8').split('\n');
       for (const line of lines) {
@@ -75,6 +78,21 @@ export function createLongMemory({ root, log = () => {} }) {
         const n = Number(String(rec.id).replace(/\D/g, ''));
         if (Number.isFinite(n)) seq = Math.max(seq, n);
       }
+    }
+    // 迁移（2026-11-17）：旧版写印象时 files[impression] 是 undefined，记录只落进了
+    // index.json，重启后按 jsonl 重建索引会让这些印象消失。这里把它们补写回 jsonl。
+    try {
+      if (fs.existsSync(indexFile)) {
+        const dump = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+        for (const rec of dump.records || []) {
+          if (!rec?.id || index.has(rec.id)) continue;
+          if (!files[rec.kind] || rec.kind === 'archive') continue;
+          index.set(rec.id, rec);
+          appendRecord(rec.kind, rec);
+        }
+      }
+    } catch {
+      // 索引文件坏了不影响正常载入
     }
     log(`[memory] 载入 ${index.size} 条长期记忆`);
     // 老记录迁移（2026-11-04）：按 convKey 推断来源，避免全被当成低可信
@@ -108,6 +126,44 @@ export function createLongMemory({ root, log = () => {} }) {
   /** 新增一条记忆。 */
   const SOURCE_TRUST = { owner: 95, self: 85, group: 55, web: 35 };
 
+  const NEGATIONS = /(不|没|别|无|不再)/;
+
+  function polarityOf(text) {
+    return NEGATIONS.test(String(text || '')) ? -1 : 1;
+  }
+
+  /**
+   * 找和这条新记忆冲突的旧记忆（只在 fact / impression 上做）。
+   *
+   * 判定：词面相似度（二字滑窗 Jaccard）+ 极性（有没有否定词）。
+   *  - 极性相反、相似度够 → 认为是同一件事的新旧说法（「不吃香菜」vs「吃香菜」）
+   *  - 有共同标签、相似度很高 → 认为是重复陈述
+   * 抛不准的宁可不动（宁可不替换，也别把对的记忆弄没）。
+   */
+  function findConflicts(kind, text, tags) {
+    if (kind !== 'fact' && kind !== 'impression') return [];
+    const tNew = new Set(tokenize(text));
+    if (tNew.size < 3) return [];
+    const polNew = polarityOf(text);
+    const tagNew = new Set(tags || []);
+    const out = [];
+    for (const rec of index.values()) {
+      if (rec.superseded || rec.kind !== kind || rec.pinned) continue;
+      const tOld = new Set(tokenize(rec.text));
+      if (tOld.size < 3) continue;
+      let shared = 0;
+      for (const t of tNew) if (tOld.has(t)) shared += 1;
+      const union = tNew.size + tOld.size - shared || 1;
+      const jac = shared / union;
+      const tagShared = (rec.tags || []).some((t) => tagNew.has(t));
+      const negFlip = polNew !== polarityOf(rec.text);
+      if ((negFlip && jac >= 0.22) || (negFlip && tagShared && jac >= 0.12) || (tagShared && jac >= 0.45)) {
+        out.push(rec);
+      }
+    }
+    return out.slice(0, 3);
+  }
+
   function note({ kind = 'event', text, tags = [], evidence = null, priority = 55, dueAt = null, convKey = '', source = 'group', trust = null, summary = null, meaning = null }) {
     const clean = String(text || '').trim();
     if (!clean) return { ok: false, error: '内容不能为空' };
@@ -136,9 +192,21 @@ export function createLongMemory({ root, log = () => {} }) {
       trust: clamp(Number(trust) || SOURCE_TRUST[source] || 55, 0, 100),
     };
     index.set(id, rec);
+
+    // 写入即判冲突：新事实成立时让旧说法失效（2026-11-08）
+    const superseded = [];
+    for (const old of findConflicts(k, clean, rec.tags)) {
+      old.superseded = true;
+      old.supersededBy = id;
+      old.supersededAt = nowIso();
+      old.supersededReason = 'conflict';
+      appendRecord('archive', { ts: nowIso(), reason: 'conflict', from: old.id, fromTitle: old.title, into: id });
+      superseded.push({ id: old.id, title: old.title });
+    }
+
     appendRecord(k, rec);
     persistIndex();
-    return { ok: true, record: rec };
+    return superseded.length ? { ok: true, record: rec, superseded } : { ok: true, record: rec };
   }
 
   /** 检索：关键词命中 × 热度，返回标题列表（不给正文）。 */
@@ -264,7 +332,18 @@ export function createLongMemory({ root, log = () => {} }) {
   function unmerge(fromId) {
     const rec = index.get(String(fromId || '').trim());
     if (!rec) return { ok: false, error: '没有这条记忆' };
-    if (!rec.superseded || !rec.mergedInto) return { ok: false, error: '这条不是被合并掉的' };
+    if (!rec.superseded || (!rec.mergedInto && !rec.supersededBy)) return { ok: false, error: '这条不是被合并/替换掉的' };
+    // 被新事实顶掉的：直接恢复，不影响别的记录
+    if (rec.supersededBy) {
+      const by = rec.supersededBy;
+      rec.superseded = false;
+      rec.supersededBy = null;
+      rec.supersededReason = null;
+      rec.updatedAt = nowIso();
+      appendRecord('archive', { ts: nowIso(), reason: 'unmerge', from: rec.id, fromTitle: rec.title, into: by });
+      persistIndex();
+      return { ok: true, restored: rec.id, from: by };
+    }
     const into = index.get(rec.mergedInto);
     if (into) {
       into.hits = Math.max(0, (Number(into.hits) || 0) - (Number(rec.hits) || 0));

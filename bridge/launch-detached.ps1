@@ -2,7 +2,7 @@
 # DSH background job: archiving the session / closing the job no longer kills it.
 # ASCII-only on purpose (Windows PowerShell 5.1 misreads UTF-8 as ANSI).
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $here) { $here = $PSScriptRoot }
+if (-not $here) { $here = 'C:\Users\Lenovo\Documents\deepseek-harness\tools\qq-bridge\qq-bridge-main' }
 $ps1 = Join-Path $here 'start-qq-bridge-detached.ps1'
 if (-not (Test-Path $ps1)) { Write-Error ('missing ' + $ps1); exit 1 }
 

@@ -62,4 +62,19 @@ function ok(name) {
   ok('buildSlangContext 只注入已确认且有含义词条');
 }
 
+// 6. 传了语料就只注入「真的出现在这段对话里」的词条；没命中返回空
+{
+  const entries = [
+    { content: '肉鸽', meaning: 'Roguelike', usage: '聊游戏', example: '打肉鸽', status: SLANG_STATUS.CONFIRMED, count: 9 },
+    { content: '杂鱼', meaning: '菜鸟', usage: '挑衅', example: '杂鱼杂鱼', status: SLANG_STATUS.CONFIRMED, count: 7 },
+    { content: '捏捏', meaning: '揉一下', usage: '撒娇', example: '让我捏捏', status: SLANG_STATUS.CONFIRMED, count: 2 },
+  ];
+  const hit = buildSlangContext(entries, 8, '有没有人打肉鸽啊\n带带');
+  assert.ok(hit.includes('肉鸽'), '命中词应注入');
+  assert.ok(!hit.includes('杂鱼'), '没出现在语料里的词不该注入');
+  const miss = buildSlangContext(entries, 8, '今天天气不错');
+  assert.strictEqual(miss, '', '没命中时应返回空串，省掉整块 token');
+  ok('buildSlangContext 按当前语料匹配，未命中不注入');
+}
+
 console.log(`\n🎉 黑话学习新增逻辑测试通过（${passed} 项）`);

@@ -1923,7 +1923,7 @@ function noteLastImage(key, file) { const d = readGenState(); d.last = d.last ||
 function getLastImage(key) { const d = readGenState(); return d.last?.[key] || ''; }
 function getStyle() { return readGenState().style || ''; }
 
-const STICKER_GEN = process.env.DSH_STICKER_GEN || path.resolve(__dirname, '..', '..', 'tools', 'doubao-image', 'gen-cli.mjs');
+const STICKER_GEN = 'C:\\Users\\Lenovo\\Documents\\deepseek-harness\\tools\\doubao-image\\gen-cli.mjs';
 const STICKER_RATE = new Map();
 
 function stickerOutDir() {
@@ -2257,7 +2257,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.setStickerR
 if (cfg.socialV2?.tools?.getForwardMsg !== false) {
   server.tool(
     'qq_get_forward_msg',
-    '查看当前会话中出现的合并转发消息/聊天记录内容（只读）。当消息文本里出现 `[转发消息 id=...]`，或 `qq_get(what="unread")` / `qq_get(what="recent")` / `qq_get(what="detail")` 返回的某条消息带 `forwardIds` / `hasForward: true` 时调用。只能查看当前会话确实收到过的转发消息 id，不能任意读取。返回内容会包含每条消息的 text、media（图片/表情元数据）与 nestedForwardIds；如果合并转发里有图片，工具会直接把最多 5 张图片以图像内容返回给视觉模型；如果里面有嵌套合并转发，会附带嵌套转发 id 和前几条预览，必要时可继续用本工具查看嵌套 id。',
+    '查看当前会话中出现的合并转发消息/聊天记录内容（只读）。当消息文本里出现 `[转发消息 id=...]`，或 `qq_get(what="unread")` / `qq_get(what="recent")` / `qq_get(what="detail")` 返回的某条消息带 `forwardIds` / `hasForward: true` 时调用。只能查看当前会话确实收到过的转发消息 id，不能任意读取。返回内容会包含每条消息的 text、media（图片/表情元数据）与 nestedForwardIds；如果合并转发里有图片，工具会直接把最多 5 张图片以图像内容返回给视觉模型；如果里面套着别的聊天记录（聊天记录套聊天记录），会自动递归展开最多 3 层，放在返回的 nested 里（每层带 depth 和 messages），不用再单独调用。',
     {
       key: z.string().describe('group:群号 或 private:QQ号'),
       token: z.string().describe('唤醒提示里的【会话令牌】'),
@@ -2288,8 +2288,13 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
           }
         };
         collectMedia(data?.messages);
-        if (Array.isArray(data?.nestedPreviews)) {
-          for (const np of data.nestedPreviews) collectMedia(np?.messages);
+        if (Array.isArray(data?.nested)) {
+          const walk = (node) => {
+            if (!node || typeof node !== 'object') return;
+            collectMedia(node.messages);
+            if (Array.isArray(node.nested)) node.nested.forEach(walk);
+          };
+          data.nested.forEach(walk);
         }
         const MAX_IMAGES = 5;
         const imageTexts = [];

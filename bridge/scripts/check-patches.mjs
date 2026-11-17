@@ -65,10 +65,7 @@ async function wakePrompt(key, reason = 'atMention') {
   return (await res.json()).prompt || '';
 }
 try {
-  const cfgPath = path.join(ROOT, 'config.json');
-  let ownerQQ = '';
-  try { ownerQQ = String((JSON.parse(fs.readFileSync(cfgPath, 'utf8')) || {}).ownerQQ || ''); } catch {}
-  const priv = ownerQQ ? await wakePrompt(`private:${ownerQQ}`) : '';
+  const priv = await wakePrompt('private:123456789');
   const checks = [
     ['【会话令牌】', '令牌行'],
     ['【精力】', '精力行'],
@@ -87,12 +84,10 @@ try {
     if (needle === '【你对他了解】') { console.log(`  ⚠️  ${name} 没出现（画像可能是空的）`); continue; }
     bad(`私聊提示词缺 ${name}`);
   }
-  let firstGroup = '';
-  try { firstGroup = String((JSON.parse(fs.readFileSync(cfgPath, 'utf8')).allow?.groups || [])[0] || ''); } catch {}
-  const ownerPrompt = firstGroup ? await wakePrompt(`group:${firstGroup}`) : '';
+  const ownerPrompt = await wakePrompt('group:975523969');
   if (ownerPrompt.includes('你是这个群的群主')) ok('群主群提示词正确');
   else bad('群主群提示词缺失');
-  const normalPrompt = ownerPrompt;
+  const normalPrompt = await wakePrompt('group:1103046717');
   if (normalPrompt.includes('你是这个群的群主')) bad('普通群误出现群主提示');
   else ok('普通群没有群主提示');
 } catch (error) {
